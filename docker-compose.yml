@@ -1,0 +1,82 @@
+# Redis nodes get static IPs so Sentinel never depends on Docker DNS:
+# a stopped container's hostname stops resolving, which stalls sentinel and blocks failover.
+networks:
+  redis-ha:
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+
+x-redis-healthcheck: &redis-healthcheck
+  test: ["CMD", "redis-cli", "ping"]
+  interval: 2s
+  timeout: 2s
+  retries: 15
+
+x-sentinel: &sentinel
+  image: redis:7.4-alpine
+  networks: [redis-ha]
+  volumes:
+    - ./sentinel/sentinel.conf:/etc/sentinel/sentinel.conf:ro
+  # Sentinel rewrites its own config, so each instance gets a private writable copy.
+  command: sh -c "cp /etc/sentinel/sentinel.conf /data/sentinel.conf && exec redis-sentinel /data/sentinel.conf"
+  healthcheck:
+    <<: *redis-healthcheck
+    test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+  depends_on:
+    redis-master:
+      condition: service_healthy
+    redis-replica-1:
+      condition: service_healthy
+    redis-replica-2:
+      condition: service_healthy
+
+services:
+  redis-master:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes
+    healthcheck: *redis-healthcheck
+    networks:
+      redis-ha:
+        ipv4_address: 10.77.0.10
+
+  redis-replica-1:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes --replicaof 10.77.0.10 6379
+    healthcheck: *redis-healthcheck
+    networks:
+      redis-ha:
+        ipv4_address: 10.77.0.11
+    depends_on:
+      redis-master:
+        condition: service_healthy
+
+  redis-replica-2:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes --replicaof 10.77.0.10 6379
+    healthcheck: *redis-healthcheck
+    networks:
+      redis-ha:
+        ipv4_address: 10.77.0.12
+    depends_on:
+      redis-master:
+        condition: service_healthy
+
+  sentinel-1: *sentinel
+  sentinel-2: *sentinel
+  sentinel-3: *sentinel
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    networks: [redis-ha]
+    environment:
+      SENTINELS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      MASTER_NAME: mymaster
+    depends_on:
+      sentinel-1:
+        condition: service_healthy
+      sentinel-2:
+        condition: service_healthy
+      sentinel-3:
+        condition: service_healthy
